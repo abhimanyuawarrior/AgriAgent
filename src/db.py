@@ -21,6 +21,7 @@ def init_db() -> None:
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
                 email TEXT,
+                role TEXT DEFAULT 'user',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -49,8 +50,13 @@ def ensure_default_user() -> None:
         ).fetchone()
         if existing is None:
             conn.execute(
-                "INSERT INTO users (username, password, email) VALUES (?, ?, ?)",
-                ("admin", "admin123", "admin@agriagent.local"),
+                "INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)",
+                ("admin", "admin123", "admin@agriagent.local", "admin"),
+            )
+            conn.commit()
+        else:
+            conn.execute(
+                "UPDATE users SET role = 'admin' WHERE username = 'admin' AND (role IS NULL OR role = '')",
             )
             conn.commit()
     finally:

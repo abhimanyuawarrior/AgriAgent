@@ -431,7 +431,16 @@ def render_crop_suitability_checker(training_df: pd.DataFrame) -> None:
             st.info(f"Estimated yield: {yield_value:.2f} tons/hectare under this profile.")
 
         st.subheader("Crop-specific threshold review")
-        threshold_df = pd.DataFrame(threshold_review["checks"])
+        threshold_rows = []
+        for check in threshold_review["checks"]:
+            cleaned = dict(check)
+            for key in ["value", "target"]:
+                if cleaned.get(key) is None:
+                    cleaned[key] = ""
+                elif isinstance(cleaned[key], (list, tuple, set)):
+                    cleaned[key] = ", ".join(str(item) for item in cleaned[key])
+            threshold_rows.append(cleaned)
+        threshold_df = pd.DataFrame(threshold_rows)
         if not threshold_df.empty:
             st.dataframe(threshold_df, width="stretch")
         if threshold_review["issues"]:
@@ -480,6 +489,9 @@ def render_crop_suitability_checker(training_df: pd.DataFrame) -> None:
 def render_dashboard() -> None:
     load_css()
     st.sidebar.markdown('<div class="sidebar-content"><h3 style="color:#ffffff; margin-bottom:0.2rem;">Welcome</h3><p style="color:#dfeef6; margin:0 0 1rem 0;">%s</p></div>' % st.session_state['username'], unsafe_allow_html=True)
+    is_admin = str(st.session_state['username']).lower() == 'admin'
+    if is_admin:
+        st.sidebar.markdown('<div style="color:#dfeef6; font-weight:700; margin-top:0.5rem;">Role: Admin</div>', unsafe_allow_html=True)
     st.sidebar.button("Logout", on_click=lambda: st.session_state.pop("username", None))
 
     recent_sessions = get_recent_sessions(st.session_state["username"], limit=5)
@@ -505,87 +517,118 @@ def render_dashboard() -> None:
         unsafe_allow_html=True,
     )
 
-    render_workflow_flow()
-
-    uploaded_files = st.file_uploader("Upload one or more agricultural datasets", type=["csv", "xlsx", "xls", "json"], accept_multiple_files=True)
-    training_df = read_uploaded_files(uploaded_files)
-    render_crop_suitability_checker(training_df)
-
-    if st.button("Run AgriAgent pipeline"):
-        try:
-            raw_df = read_uploaded_files(uploaded_files)
-            report = run_agentic_pipeline(raw_df)
-
-            st.success("Pipeline executed successfully.")
-
-            file_names = ", ".join(f.name for f in uploaded_files) if uploaded_files else "sample_agri_dataset.csv"
-            summary_text = (
-                f"Rows={report['summary'].get('rows', 0)}, "
-                f"Columns={report['summary'].get('columns', 0)}, "
-                f"Domain={report['workflow'].get('domain_detected', 'unknown')}"
-            )
-            save_session(st.session_state["username"], file_names, summary_text)
-
-            summary = report["summary"]
-            col1, col2, col3, col4 = st.columns(4)
-            col1.markdown('<div class="metric-card"><div style="color:#5f6f72; font-size:0.8rem;">Rows</div><div style="font-size:2rem; font-weight:800; color:#1d3557;">%s</div></div>' % summary.get("rows", 0), unsafe_allow_html=True)
-            col2.markdown('<div class="metric-card"><div style="color:#5f6f72; font-size:0.8rem;">Columns</div><div style="font-size:2rem; font-weight:800; color:#1d3557;">%s</div></div>' % summary.get("columns", 0), unsafe_allow_html=True)
-            col3.markdown('<div class="metric-card"><div style="color:#5f6f72; font-size:0.8rem;">Domain</div><div style="font-size:1.4rem; font-weight:800; color:#1d3557;">%s</div></div>' % report["workflow"].get("domain_detected", "unknown"), unsafe_allow_html=True)
-            col4.markdown('<div class="metric-card"><div style="color:#5f6f72; font-size:0.8rem;">Mapped fields</div><div style="font-size:2rem; font-weight:800; color:#1d3557;">%s</div></div>' % len(report["schema_mapping"]), unsafe_allow_html=True)
-
-            st.subheader("Detected agriculture context")
-            st.json(report["workflow"])
-
-            st.subheader("Data profiling")
-            st.dataframe(pd.DataFrame(report["profile_report"]), width="stretch")
-
-            st.subheader("Schema mapping")
-            mapping_df = pd.DataFrame(report["schema_mapping"])
-            if mapping_df.empty:
-                st.info("No strong agriculture schema matches were detected. Review the raw columns manually and tune the matching rules.")
-            else:
-                st.dataframe(mapping_df, width="stretch")
-
-            st.subheader("ETL execution flow")
-            for step in report["workflow"]["etl_steps"]:
-                st.write(f"- {step}")
-
-            st.subheader("Data quality validation")
-            validation = report["validation"]
-            st.json(validation)
-
-            st.subheader("Agriculture insights")
-            for insight in report["insights"]:
-                st.write(f"- {insight}")
-
-            st.subheader("Bronze vs Silver vs Gold data")
-            bronze_tab, silver_tab, gold_tab = st.tabs(["Bronze", "Silver", "Gold"])
-            with bronze_tab:
-                st.dataframe(report["bronze"].head(10), width="stretch")
-            with silver_tab:
-                st.dataframe(report["silver"].head(10), width="stretch")
-            with gold_tab:
-                st.dataframe(report["gold"].head(10), width="stretch")
-
-            st.subheader("Analytics charts")
-            for _, fig in report["charts"].items():
-                st.plotly_chart(fig, width="stretch")
-
-            gold_csv = report["gold"].to_csv(index=False)
-            st.download_button(
-                label="Download Gold layer CSV",
-                data=gold_csv,
-                file_name="agriagent_gold_dataset.csv",
-                mime="text/csv",
-            )
-
-        except Exception as exc:  # pragma: no cover
-            st.error(f"The pipeline failed: {exc}")
-
+    tabs = ["Overview", "Crop Suitability Checker"]
+    if is_admin:
+        tabs.append("Admin Pipeline View")
+    if is_admin:
+        overview_tab, crop_tab, admin_tab = st.tabs(tabs)
     else:
-        st.info("Use the sample dataset or upload a new file to start the pipeline.")
-        sample_df = pd.read_csv("data/sample_agri_dataset.csv")
-        st.dataframe(sample_df.head(10), width="stretch")
+        overview_tab, crop_tab = st.tabs(tabs)
+
+    with overview_tab:
+        uploaded_files = st.file_uploader("Upload one or more agricultural datasets", type=["csv", "xlsx", "xls", "json"], accept_multiple_files=True)
+
+        if st.button("Run AgriAgent pipeline"):
+            try:
+                raw_df = read_uploaded_files(uploaded_files)
+                report = run_agentic_pipeline(raw_df)
+
+                st.success("Pipeline executed successfully.")
+
+                file_names = ", ".join(f.name for f in uploaded_files) if uploaded_files else "sample_agri_dataset.csv"
+                summary_text = (
+                    f"Rows={report['summary'].get('rows', 0)}, "
+                    f"Columns={report['summary'].get('columns', 0)}, "
+                    f"Domain={report['workflow'].get('domain_detected', 'unknown')}"
+                )
+                save_session(st.session_state["username"], file_names, summary_text)
+
+                summary = report["summary"]
+                col1, col2, col3, col4 = st.columns(4)
+                col1.markdown('<div class="metric-card"><div style="color:#5f6f72; font-size:0.8rem;">Rows</div><div style="font-size:2rem; font-weight:800; color:#1d3557;">%s</div></div>' % summary.get("rows", 0), unsafe_allow_html=True)
+                col2.markdown('<div class="metric-card"><div style="color:#5f6f72; font-size:0.8rem;">Columns</div><div style="font-size:2rem; font-weight:800; color:#1d3557;">%s</div></div>' % summary.get("columns", 0), unsafe_allow_html=True)
+                col3.markdown('<div class="metric-card"><div style="color:#5f6f72; font-size:0.8rem;">Domain</div><div style="font-size:1.4rem; font-weight:800; color:#1d3557;">%s</div></div>' % report["workflow"].get("domain_detected", "unknown"), unsafe_allow_html=True)
+                col4.markdown('<div class="metric-card"><div style="color:#5f6f72; font-size:0.8rem;">Mapped fields</div><div style="font-size:2rem; font-weight:800; color:#1d3557;">%s</div></div>' % len(report["schema_mapping"]), unsafe_allow_html=True)
+
+                st.subheader("Detected agriculture context")
+                st.json(report["workflow"])
+
+                st.subheader("Data profiling")
+                st.dataframe(pd.DataFrame(report["profile_report"]), width="stretch")
+
+                st.subheader("Schema mapping")
+                mapping_df = pd.DataFrame(report["schema_mapping"])
+                if mapping_df.empty:
+                    st.info("No strong agriculture schema matches were detected. Review the raw columns manually and tune the matching rules.")
+                else:
+                    st.dataframe(mapping_df, width="stretch")
+
+                st.subheader("ETL execution flow")
+                for step in report["workflow"]["etl_steps"]:
+                    st.write(f"- {step}")
+
+                st.subheader("Data quality validation")
+                validation = report["validation"]
+                st.json(validation)
+
+                st.subheader("Agriculture insights")
+                for insight in report["insights"]:
+                    st.write(f"- {insight}")
+
+                st.subheader("Bronze vs Silver vs Gold data")
+                bronze_tab, silver_tab, gold_tab = st.tabs(["Bronze", "Silver", "Gold"])
+                with bronze_tab:
+                    st.dataframe(report["bronze"].head(10), width="stretch")
+                with silver_tab:
+                    st.dataframe(report["silver"].head(10), width="stretch")
+                with gold_tab:
+                    st.dataframe(report["gold"].head(10), width="stretch")
+
+                st.subheader("Analytics charts")
+                for _, fig in report["charts"].items():
+                    st.plotly_chart(fig, width="stretch")
+
+                gold_csv = report["gold"].to_csv(index=False)
+                st.download_button(
+                    label="Download Gold layer CSV",
+                    data=gold_csv,
+                    file_name="agriagent_gold_dataset.csv",
+                    mime="text/csv",
+                )
+
+            except Exception as exc:  # pragma: no cover
+                st.error(f"The pipeline failed: {exc}")
+
+        else:
+            st.info("Use the sample dataset or upload a new file to start the pipeline.")
+            sample_df = pd.read_csv("data/sample_agri_dataset.csv")
+            st.dataframe(sample_df.head(10), width="stretch")
+
+    with crop_tab:
+        training_df = read_uploaded_files(uploaded_files) if "uploaded_files" in locals() else pd.read_csv("data/sample_agri_dataset.csv")
+        render_crop_suitability_checker(training_df)
+
+    if is_admin:
+        with admin_tab:
+            st.subheader("Admin pipeline audit")
+            st.caption("Schema matching, ETL transformation logic, and validation as seen by the admin role.")
+            admin_dataset = read_uploaded_files(uploaded_files) if "uploaded_files" in locals() else pd.read_csv("data/sample_agri_dataset.csv")
+            admin_report = run_agentic_pipeline(admin_dataset)
+
+            st.subheader("Schema matching details")
+            st.dataframe(pd.DataFrame(admin_report["schema_mapping"]), width="stretch")
+
+            st.subheader("ETL + validation process")
+            st.write("- Bronze data preserved from raw uploads")
+            for step in admin_report["workflow"]["etl_steps"]:
+                st.write(f"- {step}")
+            st.json(admin_report["validation"])
+
+            st.subheader("Profile report")
+            st.dataframe(pd.DataFrame(admin_report["profile_report"]), width="stretch")
+
+            st.subheader("Workflow detection")
+            st.json(admin_report["workflow"])
 
 
 init_db()
