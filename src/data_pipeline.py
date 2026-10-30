@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from .llm import call_gemini_for_mapping
 
@@ -126,6 +131,448 @@ def profile_dataset(df: pd.DataFrame) -> List[Dict[str, Any]]:
             }
         )
     return profiles
+
+
+def train_crop_suitability_model(df: pd.DataFrame) -> Dict[str, Any]:
+    if "crop" not in df.columns:
+        return {"model": None, "status": "missing_crop_column", "feature_columns": []}
+
+    working = df.copy()
+    working["crop"] = working["crop"].astype(str).str.strip()
+    working = working.dropna(subset=["crop"]).copy()
+    if working.empty:
+        return {"model": None, "status": "empty_dataset", "feature_columns": []}
+
+    feature_columns = [
+        col for col in ["soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "season", "water_availability", "soil_type"]
+        if col in working.columns
+    ]
+    if not feature_columns:
+        return {"model": None, "status": "no_agri_features", "feature_columns": []}
+
+    numeric_features = [col for col in feature_columns if col in {"soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium"}]
+    categorical_features = [col for col in feature_columns if col not in numeric_features]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "numeric",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                ]),
+                numeric_features,
+            ),
+            (
+                "categorical",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                ]),
+                categorical_features,
+            ),
+        ],
+        remainder="drop",
+    )
+
+    model = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("classifier", RandomForestClassifier(n_estimators=250, random_state=42, class_weight="balanced")),
+        ]
+    )
+
+    model.fit(working[feature_columns], working["crop"])
+    return {
+        "model": model,
+        "status": "trained",
+        "feature_columns": feature_columns,
+        "class_names": list(model.named_steps["classifier"].classes_),
+    }
+
+
+def predict_crop_suitability(
+    df: pd.DataFrame,
+    crop_name: str,
+    soil_ph: float | None = None,
+    rainfall_mm: float | None = None,
+    temperature_c: float | None = None,
+    humidity_pct: float | None = None,
+    nitrogen: float | None = None,
+    phosphorus: float | None = None,
+    potassium: float | None = None,
+    season: str | None = None,
+    water_availability: str | None = None,
+) -> Dict[str, Any]:
+    if crop_name is None or str(crop_name).strip() == "":
+        return {"status": "invalid_crop", "message": "Please provide a valid crop name."}
+
+    crop_name = str(crop_name).strip()
+    training_state = train_crop_suitability_model(df)
+    model = training_state.get("model")
+
+    if model is None:
+        return {
+            "status": "fallback_only",
+            "crop": crop_name,
+            "suitability_label": "Needs more field data",
+            "confidence": 0.0,
+            "suitable": False,
+            "reasons": ["Add crop, soil, rainfall, temperature, and nutrient values to train the suitability model."],
+        }
+
+    feature_columns = training_state["feature_columns"]
+    input_row: Dict[str, Any] = {}
+
+    for feature in feature_columns:
+        if feature == "soil_ph":
+            input_row[feature] = soil_ph if soil_ph is not None else df[feature].median()
+        elif feature == "rainfall_mm":
+            input_row[feature] = rainfall_mm if rainfall_mm is not None else df[feature].median()
+        elif feature == "temperature_c":
+            input_row[feature] = temperature_c if temperature_c is not None else df[feature].median()
+        elif feature == "humidity_pct":
+            input_row[feature] = humidity_pct if humidity_pct is not None else df[feature].median()
+        elif feature == "nitrogen":
+            input_row[feature] = nitrogen if nitrogen is not None else df[feature].median()
+        elif feature == "phosphorus":
+            input_row[feature] = phosphorus if phosphorus is not None else df[feature].median()
+        elif feature == "potassium":
+            input_row[feature] = potassium if potassium is not None else df[feature].median()
+        elif feature == "season":
+            input_row[feature] = season if season is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Kharif"
+        elif feature == "water_availability":
+            input_row[feature] = water_availability if water_availability is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Medium"
+        elif feature == "soil_type":
+            input_row[feature] = df[feature].mode().iloc[0] if not df[feature].mode().empty else "Loamy"
+
+    input_df = pd.DataFrame([input_row], columns=feature_columns)
+    probability_values = model.predict_proba(input_df)[0]
+    class_names = training_state["class_names"]
+    prediction_index = 0
+    if crop_name.lower() in {name.lower() for name in class_names}:
+        prediction_index = next(i for i, name in enumerate(class_names) if name.lower() == crop_name.lower())
+    confidence = float(probability_values[prediction_index]) if prediction_index < len(probability_values) else float(probability_values.max())
+    if crop_name.lower() not in {name.lower() for name in class_names}:
+        confidence = min(0.6, float(probability_values.max()))
+
+    suitability = "Highly suitable" if confidence >= 0.75 else "Moderately suitable" if confidence >= 0.5 else "Low suitability"
+    suitable = confidence >= 0.5
+    reasons: List[str] = []
+
+    crop_history = df[df["crop"].astype(str).str.lower() == crop_name.lower()].copy() if "crop" in df.columns else pd.DataFrame()
+    if not crop_history.empty:
+        for metric, value in [("soil_ph", soil_ph), ("rainfall_mm", rainfall_mm), ("temperature_c", temperature_c), ("humidity_pct", humidity_pct)]:
+            if value is not None and metric in crop_history.columns:
+                mean_value = float(crop_history[metric].mean())
+                delta = abs(float(value) - mean_value)
+                if metric == "soil_ph":
+                    reasons.append(f"Soil pH {value} is {'close to' if delta <= 0.5 else 'near'} the historical range for {crop_name}.")
+                else:
+                    reasons.append(f"{metric.replace('_', ' ').title()} {value} aligns with the historical range used for {crop_name}.")
+    if not reasons:
+        reasons.append(f"The model trained on the current agriculture dataset estimates {crop_name} is {suitability.lower()} in these conditions.")
+
+    return {
+        "status": "ok",
+        "crop": crop_name,
+        "suitability_label": suitability,
+        "confidence": round(confidence, 3),
+        "suitable": suitable,
+        "reasons": reasons,
+        "model_class": class_names,
+    }
+
+
+CROP_THRESHOLD_RULES: Dict[str, Dict[str, Any]] = {
+    "rice": {
+        "soil_ph": (5.5, 7.5),
+        "rainfall_mm": (800, 1800),
+        "temperature_c": (20, 35),
+        "humidity_pct": (60, 90),
+        "nitrogen": (100, 180),
+        "phosphorus": (20, 60),
+        "potassium": (180, 300),
+        "season": ["Kharif", "Monsoon"],
+        "water_availability": ["High", "Medium"],
+    },
+    "wheat": {
+        "soil_ph": (6.0, 7.5),
+        "rainfall_mm": (450, 1000),
+        "temperature_c": (10, 25),
+        "humidity_pct": (40, 70),
+        "nitrogen": (80, 150),
+        "phosphorus": (20, 45),
+        "potassium": (150, 260),
+        "season": ["Rabi", "Winter"],
+        "water_availability": ["Medium", "Low"],
+    },
+    "cotton": {
+        "soil_ph": (5.8, 7.5),
+        "rainfall_mm": (600, 1200),
+        "temperature_c": (25, 35),
+        "humidity_pct": (45, 70),
+        "nitrogen": (90, 170),
+        "phosphorus": (20, 55),
+        "potassium": (150, 280),
+        "season": ["Kharif", "Summer"],
+        "water_availability": ["Medium", "High"],
+    },
+    "soybean": {
+        "soil_ph": (6.0, 7.0),
+        "rainfall_mm": (500, 1000),
+        "temperature_c": (20, 30),
+        "humidity_pct": (50, 75),
+        "nitrogen": (80, 150),
+        "phosphorus": (25, 50),
+        "potassium": (160, 260),
+        "season": ["Kharif", "Monsoon"],
+        "water_availability": ["Medium", "High"],
+    },
+    "maize": {
+        "soil_ph": (5.8, 7.2),
+        "rainfall_mm": (500, 1200),
+        "temperature_c": (20, 32),
+        "humidity_pct": (55, 80),
+        "nitrogen": (100, 170),
+        "phosphorus": (25, 50),
+        "potassium": (160, 280),
+        "season": ["Kharif", "Summer"],
+        "water_availability": ["Medium", "High"],
+    },
+    "sugarcane": {
+        "soil_ph": (6.0, 8.0),
+        "rainfall_mm": (1000, 1800),
+        "temperature_c": (25, 38),
+        "humidity_pct": (60, 85),
+        "nitrogen": (120, 200),
+        "phosphorus": (30, 60),
+        "potassium": (180, 320),
+        "season": ["Perennial", "Kharif"],
+        "water_availability": ["High"],
+    },
+    "groundnut": {
+        "soil_ph": (5.5, 7.0),
+        "rainfall_mm": (400, 900),
+        "temperature_c": (20, 32),
+        "humidity_pct": (45, 75),
+        "nitrogen": (80, 160),
+        "phosphorus": (20, 45),
+        "potassium": (120, 240),
+        "season": ["Kharif", "Summer"],
+        "water_availability": ["Medium", "Low"],
+    },
+    "grapes": {
+        "soil_ph": (6.2, 7.5),
+        "rainfall_mm": (500, 900),
+        "temperature_c": (18, 32),
+        "humidity_pct": (45, 70),
+        "nitrogen": (120, 180),
+        "phosphorus": (30, 55),
+        "potassium": (180, 300),
+        "season": ["Perennial", "Summer"],
+        "water_availability": ["Medium", "High"],
+    },
+}
+
+
+def evaluate_crop_thresholds(crop_name: str, conditions: Dict[str, Any]) -> Dict[str, Any]:
+    crop_key = str(crop_name).strip().lower()
+    rules = CROP_THRESHOLD_RULES.get(crop_key)
+    if not rules:
+        return {
+            "crop": crop_name,
+            "status": "unknown_crop",
+            "checks": [],
+            "issues": ["No crop-specific threshold rules are available for this crop yet."],
+        }
+
+    checks: List[Dict[str, Any]] = []
+    issues: List[str] = []
+    for metric, bounds in rules.items():
+        if metric in {"season", "water_availability"}:
+            value = conditions.get(metric)
+            allowed = bounds
+            if value is not None and value not in allowed:
+                issues.append(f"{metric.replace('_', ' ').title()} is {value}, but {crop_name.title()} prefers {', '.join(map(str, allowed))}.")
+            checks.append({"metric": metric, "value": value, "target": allowed, "status": "pass" if value in allowed else "warning"})
+            continue
+
+        value = conditions.get(metric)
+        if value is None:
+            checks.append({"metric": metric, "value": None, "target": bounds, "status": "missing"})
+            continue
+        low, high = bounds
+        status = "pass"
+        if value < low:
+            status = "low"
+            issues.append(f"{metric.replace('_', ' ').title()} is below the preferred range for {crop_name.title()}.")
+        elif value > high:
+            status = "high"
+            issues.append(f"{metric.replace('_', ' ').title()} is above the preferred range for {crop_name.title()}.")
+        checks.append({"metric": metric, "value": value, "target": bounds, "status": status})
+
+    status = "good" if not issues else "warning"
+    return {"crop": crop_name, "status": status, "checks": checks, "issues": issues}
+
+
+def train_yield_model(df: pd.DataFrame) -> Any | None:
+    if "yield_ton_per_hectare" not in df.columns:
+        return None
+
+    working = df.copy()
+    feature_columns = [
+        col for col in ["soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "season", "water_availability", "crop", "district"]
+        if col in working.columns
+    ]
+    if not feature_columns:
+        return None
+
+    numeric_features = [col for col in feature_columns if col in {"soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium"}]
+    categorical_features = [col for col in feature_columns if col not in numeric_features]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "numeric",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                ]),
+                numeric_features,
+            ),
+            (
+                "categorical",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                ]),
+                categorical_features,
+            ),
+        ],
+        remainder="drop",
+    )
+
+    model = Pipeline([
+        ("preprocessor", preprocessor),
+        ("regressor", RandomForestRegressor(n_estimators=300, random_state=42)),
+    ])
+    model.fit(working[feature_columns], working["yield_ton_per_hectare"])
+    return model
+
+
+def predict_yield_for_crop(
+    df: pd.DataFrame,
+    crop_name: str,
+    soil_ph: float | None = None,
+    rainfall_mm: float | None = None,
+    temperature_c: float | None = None,
+    humidity_pct: float | None = None,
+    nitrogen: float | None = None,
+    phosphorus: float | None = None,
+    potassium: float | None = None,
+    season: str | None = None,
+    water_availability: str | None = None,
+    district: str | None = None,
+) -> Dict[str, Any]:
+    if "yield_ton_per_hectare" not in df.columns:
+        return {"status": "no_yield_column", "predicted_yield_ton_per_hectare": None, "notes": ["This dataset does not include a target yield field, so yield forecasting is unavailable."]}
+
+    model = train_yield_model(df)
+    if model is None:
+        return {"status": "no_yield_column", "predicted_yield_ton_per_hectare": None, "notes": ["Yield forecast model could not be trained from the available dataset."]}
+
+    feature_columns = [col for col in ["soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "season", "water_availability", "crop", "district"] if col in df.columns]
+    if not feature_columns:
+        return {"status": "insufficient_features", "predicted_yield_ton_per_hectare": None, "notes": ["The dataset does not contain enough agronomic variables to estimate yield."]}
+
+    input_row: Dict[str, Any] = {}
+    for feature in feature_columns:
+        if feature == "soil_ph":
+            input_row[feature] = soil_ph if soil_ph is not None else df[feature].median()
+        elif feature == "rainfall_mm":
+            input_row[feature] = rainfall_mm if rainfall_mm is not None else df[feature].median()
+        elif feature == "temperature_c":
+            input_row[feature] = temperature_c if temperature_c is not None else df[feature].median()
+        elif feature == "humidity_pct":
+            input_row[feature] = humidity_pct if humidity_pct is not None else df[feature].median()
+        elif feature == "nitrogen":
+            input_row[feature] = nitrogen if nitrogen is not None else df[feature].median()
+        elif feature == "phosphorus":
+            input_row[feature] = phosphorus if phosphorus is not None else df[feature].median()
+        elif feature == "potassium":
+            input_row[feature] = potassium if potassium is not None else df[feature].median()
+        elif feature == "season":
+            input_row[feature] = season if season is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Kharif"
+        elif feature == "water_availability":
+            input_row[feature] = water_availability if water_availability is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Medium"
+        elif feature == "crop":
+            input_row[feature] = crop_name
+        elif feature == "district":
+            input_row[feature] = district if district is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Nagpur"
+
+    input_df = pd.DataFrame([input_row], columns=feature_columns)
+    predicted_yield = float(model.predict(input_df)[0])
+    return {
+        "status": "ok",
+        "predicted_yield_ton_per_hectare": round(predicted_yield, 3),
+        "notes": [f"Estimated yield for {crop_name.title()} under this profile is {predicted_yield:.2f} tons/hectare."],
+    }
+
+
+def recommend_best_crops_for_region(
+    df: pd.DataFrame,
+    district: str | None = None,
+    climate: str | None = None,
+    top_n: int = 3,
+) -> List[Dict[str, Any]]:
+    if df.empty:
+        return []
+
+    subset = df.copy()
+    if district and "district" in subset.columns:
+        district_matches = subset[subset["district"].astype(str).str.lower() == str(district).lower()]
+        if not district_matches.empty:
+            subset = district_matches
+
+    if climate:
+        climate_key = str(climate).lower()
+        climate_filters = []
+        if climate_key in {"hot", "dry", "semi-arid", "arid"}:
+            climate_filters = ["Low", "Medium"]
+        elif climate_key in {"humid", "wet", "tropical"}:
+            climate_filters = ["High", "Medium"]
+        elif climate_key in {"cool", "temperate"}:
+            climate_filters = ["Low", "Medium"]
+        if climate_filters and "water_availability" in subset.columns:
+            subset = subset[subset["water_availability"].isin(climate_filters)]
+
+    if subset.empty:
+        return []
+
+    crops = subset.groupby("crop").agg(
+        avg_yield=("yield_ton_per_hectare", "mean") if "yield_ton_per_hectare" in subset.columns else ("crop", "count"),
+        avg_soil_ph=("soil_ph", "mean") if "soil_ph" in subset.columns else ("crop", "count"),
+        avg_rainfall=("rainfall_mm", "mean") if "rainfall_mm" in subset.columns else ("crop", "count"),
+    ).reset_index()
+
+    if "avg_yield" in crops.columns and crops["avg_yield"].notna().any():
+        crops = crops.sort_values("avg_yield", ascending=False).head(top_n)
+    else:
+        crops = crops.head(top_n)
+
+    recommendations = []
+    for _, row in crops.iterrows():
+        crop = row.get("crop")
+        score = row.get("avg_yield", 0)
+        recommendations.append({
+            "crop": str(crop),
+            "score": round(float(score), 2) if pd.notna(score) else 0.0,
+            "avg_yield_ton_per_hectare": round(float(row.get("avg_yield", 0)), 2) if pd.notna(row.get("avg_yield")) else None,
+            "avg_soil_ph": round(float(row.get("avg_soil_ph", 0)), 2) if pd.notna(row.get("avg_soil_ph")) else None,
+            "avg_rainfall_mm": round(float(row.get("avg_rainfall", 0)), 2) if pd.notna(row.get("avg_rainfall")) else None,
+        })
+    return recommendations
 
 
 def detect_agriculture_dataset(df: pd.DataFrame) -> Dict[str, Any]:

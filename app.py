@@ -6,7 +6,14 @@ import pandas as pd
 import streamlit as st
 
 from src.agent_orchestrator import run_agentic_pipeline
+from src.data_pipeline import (
+    evaluate_crop_thresholds,
+    predict_crop_suitability,
+    predict_yield_for_crop,
+    recommend_best_crops_for_region,
+)
 from src.db import authenticate_user, ensure_default_user, get_recent_sessions, init_db, register_user, save_session
+from src.llm import generate_agronomy_explanation
 
 
 st.set_page_config(page_title="AgriAgent", page_icon="🌾", layout="wide")
@@ -331,6 +338,145 @@ def render_workflow_flow() -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
+def render_crop_suitability_checker(training_df: pd.DataFrame) -> None:
+    st.subheader("Crop suitability checker")
+    crop_options = sorted(training_df["crop"].dropna().astype(str).unique().tolist()) if "crop" in training_df.columns else ["Rice", "Wheat", "Cotton", "Soybean", "Maize", "Sugarcane", "Groundnut", "Grapes"]
+    district_options = ["Any"] + sorted(training_df["district"].dropna().astype(str).unique().tolist()) if "district" in training_df.columns else ["Any", "Nagpur", "Wardha", "Yavatmal", "Amravati", "Nashik", "Aurangabad", "Pune", "Solapur"]
+
+    with st.form("crop_suitability_form"):
+        crop_name = st.selectbox("Crop to test", crop_options)
+        district = st.selectbox("District (optional)", district_options)
+        climate = st.selectbox("Climate profile (optional)", ["Any", "Humid", "Semi-arid", "Temperate", "Tropical", "Dry"])
+
+        col1, col2, col3 = st.columns(3)
+        soil_ph = col1.number_input("Soil pH", min_value=3.0, max_value=9.5, value=6.5, step=0.1)
+        rainfall_mm = col2.number_input("Rainfall (mm)", min_value=0.0, max_value=4000.0, value=900.0, step=10.0)
+        temperature_c = col3.number_input("Temperature (°C)", min_value=0.0, max_value=60.0, value=28.0, step=1.0)
+
+        col4, col5, col6 = st.columns(3)
+        humidity_pct = col4.number_input("Humidity (%)", min_value=0.0, max_value=100.0, value=68.0, step=1.0)
+        nitrogen = col5.number_input("Nitrogen", min_value=0.0, max_value=300.0, value=140.0, step=1.0)
+        phosphorus = col6.number_input("Phosphorus", min_value=0.0, max_value=200.0, value=38.0, step=1.0)
+
+        col7, col8, col9 = st.columns(3)
+        potassium = col7.number_input("Potassium", min_value=0.0, max_value=400.0, value=245.0, step=1.0)
+        season = col8.selectbox("Season", ["Kharif", "Rabi", "Perennial", "Summer", "Winter", "Monsoon", "Autumn"], index=0)
+        water_availability = col9.selectbox("Water availability", ["Low", "Medium", "High"], index=1)
+
+        submitted = st.form_submit_button("Check suitability")
+
+    if submitted:
+        result = predict_crop_suitability(
+            training_df,
+            crop_name,
+            soil_ph=soil_ph,
+            rainfall_mm=rainfall_mm,
+            temperature_c=temperature_c,
+            humidity_pct=humidity_pct,
+            nitrogen=nitrogen,
+            phosphorus=phosphorus,
+            potassium=potassium,
+            season=season,
+            water_availability=water_availability,
+        )
+
+        threshold_review = evaluate_crop_thresholds(
+            crop_name,
+            {
+                "soil_ph": soil_ph,
+                "rainfall_mm": rainfall_mm,
+                "temperature_c": temperature_c,
+                "humidity_pct": humidity_pct,
+                "nitrogen": nitrogen,
+                "phosphorus": phosphorus,
+                "potassium": potassium,
+                "season": season,
+                "water_availability": water_availability,
+            },
+        )
+
+        yield_forecast = predict_yield_for_crop(
+            training_df,
+            crop_name,
+            soil_ph=soil_ph,
+            rainfall_mm=rainfall_mm,
+            temperature_c=temperature_c,
+            humidity_pct=humidity_pct,
+            nitrogen=nitrogen,
+            phosphorus=phosphorus,
+            potassium=potassium,
+            season=season,
+            water_availability=water_availability,
+            district=district if district != "Any" else None,
+        )
+
+        recommended_crops = recommend_best_crops_for_region(
+            training_df,
+            district=district if district != "Any" else None,
+            climate=climate if climate != "Any" else None,
+            top_n=3,
+        )
+
+        badge_color = "#2e9d64" if result["suitable"] else "#c45b3d"
+        st.markdown(
+            f"<div class='glass-card' style='margin-top: 1rem; border-left: 6px solid {badge_color};'><div style='font-size: 0.8rem; color:#5f6f72;'>Prediction</div><div style='font-size: 1.8rem; font-weight: 800; color:#1d3557;'>{result['crop']} — {result['suitability_label']}</div><div style='font-size: 1rem; color:#3a4d59;'>Confidence: {result['confidence'] * 100:.1f}%</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        for reason in result["reasons"]:
+            st.write(f"- {reason}")
+
+        yield_value = yield_forecast.get("predicted_yield_ton_per_hectare")
+        if yield_value is not None:
+            st.info(f"Estimated yield: {yield_value:.2f} tons/hectare under this profile.")
+
+        st.subheader("Crop-specific threshold review")
+        threshold_df = pd.DataFrame(threshold_review["checks"])
+        if not threshold_df.empty:
+            st.dataframe(threshold_df, width="stretch")
+        if threshold_review["issues"]:
+            for issue in threshold_review["issues"]:
+                st.warning(issue)
+
+        st.subheader("District and climate recommendation")
+        if recommended_crops:
+            st.dataframe(pd.DataFrame(recommended_crops), width="stretch")
+        else:
+            st.info("No strong regional crop recommendation was available from the uploaded data.")
+
+        llm_explanation = generate_agronomy_explanation(
+            crop_name,
+            {
+                "soil_ph": soil_ph,
+                "rainfall_mm": rainfall_mm,
+                "temperature_c": temperature_c,
+                "humidity_pct": humidity_pct,
+                "nitrogen": nitrogen,
+                "phosphorus": phosphorus,
+                "potassium": potassium,
+                "season": season,
+                "water_availability": water_availability,
+            },
+            district=district if district != "Any" else None,
+            climate=climate if climate != "Any" else None,
+            yield_estimate=yield_value,
+            suitability=result.get("suitability_label"),
+            confidence=result.get("confidence"),
+        )
+
+        st.subheader("AI agronomy explanation")
+        st.write(llm_explanation.get("summary", "No summary available."))
+        with st.expander("Risks"):
+            for risk in llm_explanation.get("risks", []):
+                st.write(f"- {risk}")
+        with st.expander("Recommendations"):
+            for recommendation in llm_explanation.get("recommendations", []):
+                st.write(f"- {recommendation}")
+        with st.expander("Next actions"):
+            for action in llm_explanation.get("next_actions", []):
+                st.write(f"- {action}")
+
+
 def render_dashboard() -> None:
     load_css()
     st.sidebar.markdown('<div class="sidebar-content"><h3 style="color:#ffffff; margin-bottom:0.2rem;">Welcome</h3><p style="color:#dfeef6; margin:0 0 1rem 0;">%s</p></div>' % st.session_state['username'], unsafe_allow_html=True)
@@ -362,6 +508,8 @@ def render_dashboard() -> None:
     render_workflow_flow()
 
     uploaded_files = st.file_uploader("Upload one or more agricultural datasets", type=["csv", "xlsx", "xls", "json"], accept_multiple_files=True)
+    training_df = read_uploaded_files(uploaded_files)
+    render_crop_suitability_checker(training_df)
 
     if st.button("Run AgriAgent pipeline"):
         try:
