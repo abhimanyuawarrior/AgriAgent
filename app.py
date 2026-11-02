@@ -10,7 +10,7 @@ try:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 except Exception:  # pragma: no cover
     colors = None
     letter = None
@@ -30,6 +30,8 @@ from src.data_pipeline import (
     recommend_best_crops_for_region,
 )
 from src.db import authenticate_user, ensure_default_user, get_recent_sessions, init_db, register_user, save_session
+import plotly.io as pio
+
 from src.llm import generate_agronomy_explanation, generate_professional_pdf_copy
 
 
@@ -467,6 +469,160 @@ def generate_crop_report_pdf(
         return buffer.getvalue()
     except Exception:
         return _build_minimal_pdf(report_lines)
+
+
+def generate_dashboard_report_pdf(report: dict) -> bytes:
+    summary = report.get("summary", {})
+    workflow = report.get("workflow", {})
+    insights = report.get("insights", [])
+    charts = report.get("charts", {})
+
+    try:
+        if not all([colors, letter, getSampleStyleSheet, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle, Image, PageBreak]):
+            raise RuntimeError("reportlab is required to generate PDF exports.")
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=42, leftMargin=42, topMargin=30, bottomMargin=30)
+        styles = getSampleStyleSheet()
+
+        brand_style = ParagraphStyle(
+            "BrandStyle",
+            parent=styles["Heading3"],
+            fontName="Helvetica-Bold",
+            fontSize=12,
+            textColor=colors.HexColor("#2d7d57"),
+            spaceAfter=0,
+        )
+        title_style = ParagraphStyle(
+            "TitleStyle",
+            parent=styles["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=22,
+            leading=28,
+            textColor=colors.HexColor("#113a2c"),
+            spaceAfter=8,
+        )
+        subtitle_style = ParagraphStyle(
+            "SubtitleStyle",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=10,
+            leading=14,
+            textColor=colors.HexColor("#44635a"),
+            spaceAfter=12,
+        )
+        section_style = ParagraphStyle(
+            "SectionStyle",
+            parent=styles["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            leading=14,
+            textColor=colors.HexColor("#1d3f2d"),
+            spaceBefore=10,
+            spaceAfter=6,
+        )
+        body_style = ParagraphStyle(
+            "BodyStyle",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=9.5,
+            leading=13,
+            textColor=colors.HexColor("#1f2d24"),
+            spaceAfter=4,
+        )
+        summary_box = ParagraphStyle(
+            "SummaryBox",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=10,
+            leading=15,
+            textColor=colors.HexColor("#123a2a"),
+            backColor=colors.HexColor("#eefaf2"),
+            borderColor=colors.HexColor("#cfead8"),
+            borderWidth=1,
+            spaceBefore=6,
+            spaceAfter=12,
+            leftIndent=8,
+            rightIndent=8,
+            paddingLeft=8,
+            paddingRight=8,
+            paddingTop=7,
+            paddingBottom=7,
+        )
+
+        story = []
+        story.append(Paragraph("AgriAgent", brand_style))
+        story.append(Paragraph("Dashboard Report", title_style))
+        story.append(Paragraph("Agriculture intelligence overview and operational dashboard", subtitle_style))
+
+        metric_rows = [
+            ["Domain", workflow.get("domain_detected", "unknown")],
+            ["Rows", str(summary.get("rows", 0))],
+            ["Columns", str(summary.get("columns", 0))],
+            ["Mapped fields", str(len(report.get("schema_mapping", [])))],
+            ["Validation status", str(report.get("validation", {}).get("status", "unknown"))],
+        ]
+        metrics = Table(metric_rows, colWidths=[180, 320])
+        metrics.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e7a44")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("GRID", (0, 0), (-1, -1), 1, colors.HexColor("#d9e9df")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#ffffff"), colors.HexColor("#f5fbf7")]),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("PADDING", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        story.append(metrics)
+        story.append(Spacer(1, 14))
+
+        story.append(Paragraph("Executive summary", section_style))
+        exec_text = (
+            f"The current dataset covers {summary.get('rows', 0)} rows and {summary.get('columns', 0)} columns across the {workflow.get('domain_detected', 'unknown')} domain. "
+            f"The pipeline mapped {len(report.get('schema_mapping', []))} agronomic fields and validated the transformation workflow for export-ready analysis."
+        )
+        story.append(Paragraph(exec_text, summary_box))
+
+        story.append(Paragraph("Key insights", section_style))
+        for insight in insights[:8]:
+            story.append(Paragraph(f"- {insight}", body_style))
+
+        if workflow.get("etl_steps"):
+            story.append(Paragraph("ETL flow", section_style))
+            for step in workflow["etl_steps"][:8]:
+                story.append(Paragraph(f"- {step}", body_style))
+
+        story.append(PageBreak())
+
+        if charts:
+            story.append(Paragraph("Analytics charts", section_style))
+            chart_items = list(charts.items())[:4]
+            for index, (chart_name, fig) in enumerate(chart_items):
+                try:
+                    png_bytes = pio.to_image(fig, format="png", scale=2)
+                    story.append(Paragraph(str(chart_name), body_style))
+                    story.append(Image(io.BytesIO(png_bytes), width=500, height=260))
+                    if index < len(chart_items) - 1:
+                        story.append(Spacer(1, 12))
+                except Exception:
+                    story.append(Paragraph(f"Chart unavailable: {chart_name}", body_style))
+
+        doc.build(story)
+        return buffer.getvalue()
+    except Exception:
+        lines = [
+            "AgriAgent Dashboard Report",
+            f"Domain: {workflow.get('domain_detected', 'unknown')}",
+            f"Rows: {summary.get('rows', 0)}",
+            f"Columns: {summary.get('columns', 0)}",
+        ]
+        for insight in insights[:8]:
+            lines.append(f"- {insight}")
+        return _build_minimal_pdf(lines)
 
 
 def read_uploaded_file(uploaded_file, max_rows: int | None = None) -> pd.DataFrame:
@@ -1065,6 +1221,14 @@ def render_dashboard() -> None:
                     data=gold_csv,
                     file_name="agriagent_gold_dataset.csv",
                     mime="text/csv",
+                )
+
+                dashboard_pdf = generate_dashboard_report_pdf(report)
+                st.download_button(
+                    label="Download dashboard PDF",
+                    data=dashboard_pdf,
+                    file_name="agriagent_dashboard_report.pdf",
+                    mime="application/pdf",
                 )
 
             except Exception as exc:  # pragma: no cover
