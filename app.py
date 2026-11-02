@@ -3,6 +3,9 @@ import os
 import re
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
@@ -249,6 +252,55 @@ def _build_minimal_pdf(lines: list[str]) -> bytes:
         pdf.extend(f"{offset:010d} 00000 n \n".encode("latin-1"))
     pdf.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_position}\n%%EOF\n".encode("latin-1"))
     return bytes(pdf)
+
+
+def _figure_to_png_bytes(fig) -> bytes:
+    if fig is None:
+        raise ValueError("Chart figure is missing.")
+
+    for func in (
+        lambda: pio.to_image(fig, format="png", width=900, height=420, scale=2),
+        lambda: pio.to_image(fig, format="png", engine="kaleido", scale=2),
+    ):
+        try:
+            image_bytes = func()
+            if isinstance(image_bytes, (bytes, bytearray)) and image_bytes:
+                return bytes(image_bytes)
+        except Exception:
+            continue
+
+    buffer = io.BytesIO()
+    try:
+        pio.write_image(fig, buffer, format="png", scale=2)
+        image_bytes = buffer.getvalue()
+        if image_bytes:
+            return image_bytes
+    except Exception:
+        pass
+
+    try:
+        plt.close("all")
+        placeholder_fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.set_axis_off()
+        ax.text(
+            0.5,
+            0.5,
+            "Chart preview unavailable\nin deployed environment",
+            ha="center",
+            va="center",
+            fontsize=12,
+            color="#123a2a",
+            wrap=True,
+        )
+        placeholder_fig.tight_layout()
+        placeholder_fig.savefig(buffer, format="png", dpi=150)
+        image_bytes = buffer.getvalue()
+        if image_bytes:
+            return image_bytes
+    except Exception:
+        pass
+
+    raise ValueError("Unable to render chart PNG for the PDF export.")
 
 
 def generate_crop_report_pdf(
@@ -603,7 +655,7 @@ def generate_dashboard_report_pdf(report: dict) -> bytes:
             chart_items = list(charts.items())[:4]
             for index, (chart_name, fig) in enumerate(chart_items):
                 try:
-                    png_bytes = pio.to_image(fig, format="png", scale=2)
+                    png_bytes = _figure_to_png_bytes(fig)
                     story.append(Paragraph(str(chart_name), body_style))
                     story.append(Image(io.BytesIO(png_bytes), width=500, height=260))
                     if index < len(chart_items) - 1:

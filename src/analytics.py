@@ -23,37 +23,63 @@ def generate_agriculture_summary(df: pd.DataFrame) -> Dict[str, Any]:
 
 def generate_chart_collection(df: pd.DataFrame) -> Dict[str, Any]:
     charts: Dict[str, Any] = {}
+    if df is None or df.empty:
+        return {"data_status": px.bar(x=["No data"], y=[0], title="No chart data available")}
+
+    numeric_columns = [col for col in df.select_dtypes(include=["number"]).columns if col not in {"index"}]
 
     if "crop" in df.columns:
-        crop_counts = df["crop"].value_counts().reset_index()
+        crop_counts = df["crop"].dropna().astype(str).value_counts().reset_index()
         crop_counts.columns = ["crop", "count"]
-        charts["crop_distribution"] = px.bar(crop_counts, x="crop", y="count", title="Crop Distribution")
+        if not crop_counts.empty:
+            charts["crop_distribution"] = px.bar(crop_counts, x="crop", y="count", title="Crop Distribution")
 
     if "soil_ph" in df.columns and "yield_ton_per_hectare" in df.columns:
-        charts["yield_vs_soil"] = px.scatter(
-            df,
-            x="soil_ph",
-            y="yield_ton_per_hectare",
-            color="crop" if "crop" in df.columns else None,
-            title="Yield vs Soil pH",
-        )
+        plot_columns = ["soil_ph", "yield_ton_per_hectare"]
+        if "crop" in df.columns:
+            plot_columns.append("crop")
+        valid = df[plot_columns].dropna(subset=["soil_ph", "yield_ton_per_hectare"])
+        if not valid.empty:
+            charts["yield_vs_soil"] = px.scatter(
+                valid,
+                x="soil_ph",
+                y="yield_ton_per_hectare",
+                color="crop" if "crop" in valid.columns else None,
+                title="Yield vs Soil pH",
+            )
 
     if "rainfall_mm" in df.columns and "yield_ton_per_hectare" in df.columns:
-        charts["yield_vs_rainfall"] = px.scatter(
-            df,
-            x="rainfall_mm",
-            y="yield_ton_per_hectare",
-            color="crop" if "crop" in df.columns else None,
-            title="Yield vs Rainfall",
-        )
+        plot_columns = ["rainfall_mm", "yield_ton_per_hectare"]
+        if "crop" in df.columns:
+            plot_columns.append("crop")
+        valid = df[plot_columns].dropna(subset=["rainfall_mm", "yield_ton_per_hectare"])
+        if not valid.empty:
+            charts["yield_vs_rainfall"] = px.scatter(
+                valid,
+                x="rainfall_mm",
+                y="yield_ton_per_hectare",
+                color="crop" if "crop" in valid.columns else None,
+                title="Yield vs Rainfall",
+            )
 
     if "district" in df.columns:
-        grouped = df.groupby("district")["yield_ton_per_hectare"].mean().reset_index() if "yield_ton_per_hectare" in df.columns else df.groupby("district").size().reset_index()
+        district_col = "district"
         if "yield_ton_per_hectare" in df.columns:
-            grouped.columns = ["district", "avg_yield"]
-        else:
-            grouped.columns = ["district", "count"]
-        charts["regional_yield"] = px.bar(grouped, x="district", y=grouped.columns[1], title="Regional Yield")
+            grouped = df[[district_col, "yield_ton_per_hectare"]].dropna().groupby(district_col)["yield_ton_per_hectare"].mean().reset_index()
+            grouped.columns = [district_col, "avg_yield"]
+            if not grouped.empty:
+                charts["regional_yield"] = px.bar(grouped, x=district_col, y="avg_yield", title="Regional Yield")
+        elif not df[district_col].dropna().empty:
+            grouped = df[district_col].dropna().value_counts().reset_index()
+            grouped.columns = [district_col, "count"]
+            charts["regional_yield"] = px.bar(grouped, x=district_col, y="count", title="Regional Yield")
+
+    if not charts and numeric_columns:
+        first_numeric = numeric_columns[0]
+        charts["numeric_overview"] = px.histogram(df, x=first_numeric, nbins=12, title=f"{first_numeric} Overview")
+
+    if not charts:
+        charts["record_count"] = px.bar(x=["Records"], y=[len(df)], title="Record Count")
 
     return charts
 
