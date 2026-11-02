@@ -4,10 +4,11 @@ AgriAgent is an agentic AI platform for automated data engineering and intellige
 
 ## Features
 
-- CSV, JSON, and Excel ingestion
+- CSV, JSON, and Excel ingestion for single or multiple uploaded datasets
 - Automatic dataset profiling and schema mapping
 - Bronze, Silver, and Gold medallion layers
 - Data validation and self-correction guidance
+- Automated dataset cleaning and preparation agent for downstream analytics
 - Agriculture analytics and crop-value insights
 - Streamlit dashboard for interactive exploration
 
@@ -16,11 +17,11 @@ AgriAgent is an agentic AI platform for automated data engineering and intellige
 1. Create and activate a virtual environment.
 2. Install dependencies:
    `pip install -r requirements.txt`
-3. Configure optional Gemini access:
-   copy `.env.example` to `.env` and set `GEMINI_API_KEY` if you want LLM-based schema recommendation.
+3. Configure optional access keys:
+   create a `.env` file and set `GEMINI_API_KEY` for LLM-based schema recommendation, and `FAOSTAT_API_TOKEN` for live FAOSTAT crop/yield/rainfall data.
 4. Start the app:
    `python -m streamlit run app.py`
-5. Log in with the default admin account (`admin` / `admin123`) or create a new one and upload a CSV, JSON, or Excel dataset.
+5. Log in with the default admin account (`admin` / `admin123`) or create a new one and upload a single or multiple CSV, JSON, or Excel datasets; the agent will clean and prepare them for downstream processing.
 
 ## Project structure
 

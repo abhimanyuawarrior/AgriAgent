@@ -24,7 +24,7 @@ CANONICAL_FIELDS: Dict[str, List[str]] = {
     "phosphorus": ["phosphorus", "p_level", "p_content", "p", "phosphorous", "phosphorus_value"],
     "potassium": ["potassium", "k_level", "k_content", "k", "potash", "potassium_value"],
     "yield_ton_per_hectare": ["yield", "yield_ton_per_hectare", "production", "output", "yield_t ha", "yield_per_hectare", "harvest", "production_ton_hectare"],
-    "district": ["district", "location", "area", "region", "state", "block", "taluka", "village"],
+    "district": ["district", "district_name", "districtname", "location", "location_name", "region", "region_name", "state", "state_name", "province", "block", "taluka", "village", "city", "area", "area_name"],
     "season": ["season", "crop_season", "growing_season", "sowing_season", "month"],
     "water_availability": ["water_availability", "water_source", "irrigation", "water", "water_supply", "canal"],
     "soil_type": ["soil_type", "soil_class", "soil_texture", "soilcategory"],
@@ -75,6 +75,55 @@ def score_field_match(column_name: str, canonical_field: str) -> float:
     return best
 
 
+def resolve_column_name(df: pd.DataFrame, *candidates: str) -> str | None:
+    normalized_lookup = {
+        str(col).strip().lower().replace(" ", "_").replace("-", "_"): col
+        for col in df.columns
+    }
+    candidate_norms = [
+        str(candidate).strip().lower().replace(" ", "_").replace("-", "_")
+        for candidate in candidates
+    ]
+
+    for normalized in candidate_norms:
+        if normalized in normalized_lookup:
+            return normalized_lookup[normalized]
+
+    best_column = None
+    best_score = 0.0
+    for col in df.columns:
+        col_norm = str(col).strip().lower().replace(" ", "_").replace("-", "_")
+        for normalized in candidate_norms:
+            if len(normalized.split("_")) == 1 and len(col_norm.split("_")) > 1:
+                continue
+            score = alias_similarity(col_norm, normalized)
+            if score > best_score and score >= 0.9:
+                best_score = score
+                best_column = col
+
+    return best_column
+
+
+def normalize_agricultural_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    working = df.copy()
+    assigned_canonical_names = set()
+    for canonical_name, aliases in CANONICAL_FIELDS.items():
+        source_col = resolve_column_name(working, canonical_name, *aliases)
+        if source_col is None:
+            continue
+        if canonical_name in assigned_canonical_names:
+            continue
+        if str(source_col).strip().lower() in assigned_canonical_names:
+            continue
+        if source_col != canonical_name:
+            working = working.rename(columns={source_col: canonical_name})
+        assigned_canonical_names.add(canonical_name)
+    return working
+
+
 def load_dataset(file_path: str | Path) -> pd.DataFrame:
     path = Path(file_path)
     suffix = path.suffix.lower()
@@ -95,6 +144,7 @@ def load_dataset(file_path: str | Path) -> pd.DataFrame:
 def profile_dataset(df: pd.DataFrame) -> List[Dict[str, Any]]:
     profiles: List[Dict[str, Any]] = []
     for col in df.columns:
+        normalized_col = str(col)
         series = df[col]
         missing_count = int(series.isna().sum())
         missing_pct = round(float(series.isna().mean() * 100), 2)
@@ -113,14 +163,14 @@ def profile_dataset(df: pd.DataFrame) -> List[Dict[str, Any]]:
             quality_flags.append("mixed_types")
         if series.duplicated().mean() > 0.05:
             quality_flags.append("duplicate_values")
-        if col.lower().endswith(("_ph", "_mm", "_c", "_pct")) or col.lower() in {"soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "yield_ton_per_hectare"}:
+        if normalized_col.lower().endswith(("_ph", "_mm", "_c", "_pct")) or normalized_col.lower() in {"soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "yield_ton_per_hectare"}:
             numeric_like = pd.to_numeric(series, errors="coerce")
             if numeric_like.notna().sum() > 0 and (numeric_like.isna().sum() / max(len(series), 1)) > 0.1:
                 quality_flags.append("non_numeric_values")
 
         profiles.append(
             {
-                "column": col,
+                "column": normalized_col,
                 "dtype": str(series.dtype),
                 "missing_count": missing_count,
                 "missing_pct": missing_pct,
@@ -134,21 +184,25 @@ def profile_dataset(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 
 def train_crop_suitability_model(df: pd.DataFrame) -> Dict[str, Any]:
-    if "crop" not in df.columns:
+    working = normalize_agricultural_columns(df)
+    if "crop" not in working.columns:
         return {"model": None, "status": "missing_crop_column", "feature_columns": []}
 
-    working = df.copy()
+    working = working.copy()
     working["crop"] = working["crop"].astype(str).str.strip()
     working = working.dropna(subset=["crop"]).copy()
     if working.empty:
         return {"model": None, "status": "empty_dataset", "feature_columns": []}
 
+    if len(working) > 12000:
+        working = working.sample(n=12000, random_state=42).copy()
+
     feature_columns = [
         col for col in ["soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "season", "water_availability", "soil_type"]
         if col in working.columns
     ]
-    if not feature_columns:
-        return {"model": None, "status": "no_agri_features", "feature_columns": []}
+    if not feature_columns or len(feature_columns) < 3:
+        return {"model": None, "status": "insufficient_agri_features", "feature_columns": feature_columns}
 
     numeric_features = [col for col in feature_columns if col in {"soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium"}]
     categorical_features = [col for col in feature_columns if col not in numeric_features]
@@ -178,7 +232,7 @@ def train_crop_suitability_model(df: pd.DataFrame) -> Dict[str, Any]:
     model = Pipeline(
         steps=[
             ("preprocessor", preprocessor),
-            ("classifier", RandomForestClassifier(n_estimators=250, random_state=42, class_weight="balanced")),
+            ("classifier", RandomForestClassifier(n_estimators=80, random_state=42, class_weight="balanced")),
         ]
     )
 
@@ -207,18 +261,53 @@ def predict_crop_suitability(
     if crop_name is None or str(crop_name).strip() == "":
         return {"status": "invalid_crop", "message": "Please provide a valid crop name."}
 
+    normalized_df = normalize_agricultural_columns(df)
     crop_name = str(crop_name).strip()
-    training_state = train_crop_suitability_model(df)
+    training_state = train_crop_suitability_model(normalized_df)
     model = training_state.get("model")
 
     if model is None:
+        threshold_review = evaluate_crop_thresholds(
+            crop_name,
+            {
+                "soil_ph": soil_ph,
+                "rainfall_mm": rainfall_mm,
+                "temperature_c": temperature_c,
+                "humidity_pct": humidity_pct,
+                "nitrogen": nitrogen,
+                "phosphorus": phosphorus,
+                "potassium": potassium,
+                "season": season,
+                "water_availability": water_availability,
+            },
+        )
+        checks = threshold_review.get("checks", [])
+        total_checks = max(len(checks), 1)
+        passed = sum(1 for check in checks if check.get("status") == "pass")
+        pass_ratio = passed / total_checks if checks else 0.0
+        confidence = round(max(0.20, min(0.9, 0.15 + pass_ratio * 0.75)), 3) if checks else 0.35
+
+        if threshold_review.get("status") == "unknown_crop" or not checks:
+            suitability = "Moderately suitable" if confidence >= 0.45 else "Low suitability"
+            suitable = confidence >= 0.45
+        elif pass_ratio >= 0.8 and confidence >= 0.75:
+            suitability = "Highly suitable"
+            suitable = True
+        elif pass_ratio >= 0.5 or confidence >= 0.5:
+            suitability = "Moderately suitable"
+            suitable = True
+        else:
+            suitability = "Low suitability"
+            suitable = False
+
         return {
             "status": "fallback_only",
             "crop": crop_name,
-            "suitability_label": "Needs more field data",
-            "confidence": 0.0,
-            "suitable": False,
-            "reasons": ["Add crop, soil, rainfall, temperature, and nutrient values to train the suitability model."],
+            "suitability_label": suitability,
+            "confidence": confidence,
+            "suitable": suitable,
+            "reasons": threshold_review.get("issues") or ["The dataset does not contain enough agronomic fields, so the rule-based suitability estimate is being used."],
+            "threshold_review": threshold_review,
         }
 
     feature_columns = training_state["feature_columns"]
@@ -226,25 +315,25 @@ def predict_crop_suitability(
 
     for feature in feature_columns:
         if feature == "soil_ph":
-            input_row[feature] = soil_ph if soil_ph is not None else df[feature].median()
+            input_row[feature] = soil_ph if soil_ph is not None else normalized_df[feature].median()
         elif feature == "rainfall_mm":
-            input_row[feature] = rainfall_mm if rainfall_mm is not None else df[feature].median()
+            input_row[feature] = rainfall_mm if rainfall_mm is not None else normalized_df[feature].median()
         elif feature == "temperature_c":
-            input_row[feature] = temperature_c if temperature_c is not None else df[feature].median()
+            input_row[feature] = temperature_c if temperature_c is not None else normalized_df[feature].median()
         elif feature == "humidity_pct":
-            input_row[feature] = humidity_pct if humidity_pct is not None else df[feature].median()
+            input_row[feature] = humidity_pct if humidity_pct is not None else normalized_df[feature].median()
         elif feature == "nitrogen":
-            input_row[feature] = nitrogen if nitrogen is not None else df[feature].median()
+            input_row[feature] = nitrogen if nitrogen is not None else normalized_df[feature].median()
         elif feature == "phosphorus":
-            input_row[feature] = phosphorus if phosphorus is not None else df[feature].median()
+            input_row[feature] = phosphorus if phosphorus is not None else normalized_df[feature].median()
         elif feature == "potassium":
-            input_row[feature] = potassium if potassium is not None else df[feature].median()
+            input_row[feature] = potassium if potassium is not None else normalized_df[feature].median()
         elif feature == "season":
-            input_row[feature] = season if season is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Kharif"
+            input_row[feature] = season if season is not None else normalized_df[feature].mode().iloc[0] if not normalized_df[feature].mode().empty else "Kharif"
         elif feature == "water_availability":
-            input_row[feature] = water_availability if water_availability is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Medium"
+            input_row[feature] = water_availability if water_availability is not None else normalized_df[feature].mode().iloc[0] if not normalized_df[feature].mode().empty else "Medium"
         elif feature == "soil_type":
-            input_row[feature] = df[feature].mode().iloc[0] if not df[feature].mode().empty else "Loamy"
+            input_row[feature] = normalized_df[feature].mode().iloc[0] if not normalized_df[feature].mode().empty else "Loamy"
 
     input_df = pd.DataFrame([input_row], columns=feature_columns)
     probability_values = model.predict_proba(input_df)[0]
@@ -256,11 +345,48 @@ def predict_crop_suitability(
     if crop_name.lower() not in {name.lower() for name in class_names}:
         confidence = min(0.6, float(probability_values.max()))
 
+    threshold_review = evaluate_crop_thresholds(
+        crop_name,
+        {
+            "soil_ph": soil_ph,
+            "rainfall_mm": rainfall_mm,
+            "temperature_c": temperature_c,
+            "humidity_pct": humidity_pct,
+            "nitrogen": nitrogen,
+            "phosphorus": phosphorus,
+            "potassium": potassium,
+            "season": season,
+            "water_availability": water_availability,
+        },
+    )
+    threshold_checks = threshold_review.get("checks", [])
+    if threshold_checks:
+        passed_checks = sum(1 for check in threshold_checks if check.get("status") == "pass")
+        rule_score = passed_checks / len(threshold_checks)
+        if threshold_review.get("status") == "unknown_crop":
+            confidence = min(confidence, 0.68)
+        elif threshold_review.get("status") == "warning":
+            confidence = min(confidence, max(0.38, rule_score * 0.65 + 0.15))
+        elif rule_score < 0.7:
+            confidence = min(confidence, max(0.38, rule_score * 0.8 + 0.1))
+
+    if threshold_review.get("status") == "unknown_crop" or not threshold_checks or threshold_review.get("issues"):
+        confidence = min(confidence, 0.68)
+
     suitability = "Highly suitable" if confidence >= 0.75 else "Moderately suitable" if confidence >= 0.5 else "Low suitability"
     suitable = confidence >= 0.5
+    if threshold_review.get("status") == "unknown_crop" or not threshold_checks:
+        suitability = "Moderately suitable" if confidence >= 0.45 else "Low suitability"
+        suitable = confidence >= 0.45
+    elif threshold_review.get("issues") and confidence < 0.6:
+        suitability = "Low suitability" if confidence < 0.45 else "Moderately suitable"
+        suitable = confidence >= 0.45
     reasons: List[str] = []
 
-    crop_history = df[df["crop"].astype(str).str.lower() == crop_name.lower()].copy() if "crop" in df.columns else pd.DataFrame()
+    if threshold_review.get("issues"):
+        reasons.extend(threshold_review["issues"][:3])
+
+    crop_history = normalized_df[normalized_df["crop"].astype(str).str.lower() == crop_name.lower()].copy() if "crop" in normalized_df.columns else pd.DataFrame()
     if not crop_history.empty:
         for metric, value in [("soil_ph", soil_ph), ("rainfall_mm", rainfall_mm), ("temperature_c", temperature_c), ("humidity_pct", humidity_pct)]:
             if value is not None and metric in crop_history.columns:
@@ -281,6 +407,7 @@ def predict_crop_suitability(
         "suitable": suitable,
         "reasons": reasons,
         "model_class": class_names,
+        "threshold_review": threshold_review,
     }
 
 
@@ -417,10 +544,16 @@ def evaluate_crop_thresholds(crop_name: str, conditions: Dict[str, Any]) -> Dict
 
 
 def train_yield_model(df: pd.DataFrame) -> Any | None:
-    if "yield_ton_per_hectare" not in df.columns:
+    working = normalize_agricultural_columns(df)
+    if "yield_ton_per_hectare" not in working.columns:
         return None
 
-    working = df.copy()
+    working = working.copy()
+    working["yield_ton_per_hectare"] = pd.to_numeric(working["yield_ton_per_hectare"], errors="coerce")
+    working = working.dropna(subset=["yield_ton_per_hectare"]).copy()
+    if working.empty:
+        return None
+
     feature_columns = [
         col for col in ["soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "season", "water_availability", "crop", "district"]
         if col in working.columns
@@ -428,8 +561,21 @@ def train_yield_model(df: pd.DataFrame) -> Any | None:
     if not feature_columns:
         return None
 
-    numeric_features = [col for col in feature_columns if col in {"soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium"}]
-    categorical_features = [col for col in feature_columns if col not in numeric_features]
+    for col in ["soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium"]:
+        if col in working.columns:
+            working[col] = pd.to_numeric(working[col], errors="coerce")
+
+    numeric_features = [
+        col for col in feature_columns
+        if col in {"soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium"}
+        and working[col].notna().any()
+    ]
+    categorical_features = [
+        col for col in feature_columns
+        if col not in numeric_features and working[col].notna().any()
+    ]
+    if not numeric_features and not categorical_features:
+        return None
 
     preprocessor = ColumnTransformer(
         transformers=[
@@ -455,7 +601,7 @@ def train_yield_model(df: pd.DataFrame) -> Any | None:
 
     model = Pipeline([
         ("preprocessor", preprocessor),
-        ("regressor", RandomForestRegressor(n_estimators=300, random_state=42)),
+        ("regressor", RandomForestRegressor(n_estimators=150, random_state=42)),
     ])
     model.fit(working[feature_columns], working["yield_ton_per_hectare"])
     return model
@@ -475,41 +621,67 @@ def predict_yield_for_crop(
     water_availability: str | None = None,
     district: str | None = None,
 ) -> Dict[str, Any]:
-    if "yield_ton_per_hectare" not in df.columns:
+    normalized_df = normalize_agricultural_columns(df)
+    if "yield_ton_per_hectare" not in normalized_df.columns:
         return {"status": "no_yield_column", "predicted_yield_ton_per_hectare": None, "notes": ["This dataset does not include a target yield field, so yield forecasting is unavailable."]}
 
-    model = train_yield_model(df)
-    if model is None:
-        return {"status": "no_yield_column", "predicted_yield_ton_per_hectare": None, "notes": ["Yield forecast model could not be trained from the available dataset."]}
+    normalized_df = normalized_df.copy()
+    normalized_df["yield_ton_per_hectare"] = pd.to_numeric(normalized_df["yield_ton_per_hectare"], errors="coerce")
 
-    feature_columns = [col for col in ["soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "season", "water_availability", "crop", "district"] if col in df.columns]
-    if not feature_columns:
-        return {"status": "insufficient_features", "predicted_yield_ton_per_hectare": None, "notes": ["The dataset does not contain enough agronomic variables to estimate yield."]}
+    if len(normalized_df) > 15000:
+        crop_history = normalized_df[normalized_df["crop"].astype(str).str.lower() == str(crop_name).lower()].copy() if "crop" in normalized_df.columns else pd.DataFrame()
+        fallback_yield = float(crop_history["yield_ton_per_hectare"].median()) if not crop_history.empty and crop_history["yield_ton_per_hectare"].notna().any() else float(normalized_df["yield_ton_per_hectare"].median()) if normalized_df["yield_ton_per_hectare"].notna().any() else 0.0
+        return {
+            "status": "fallback_only",
+            "predicted_yield_ton_per_hectare": round(fallback_yield, 3),
+            "notes": [f"The default dataset is too large for a reliable live yield model, so a median-based estimate is used for {crop_name.title()}."],
+        }
+
+    feature_columns = [col for col in ["soil_ph", "rainfall_mm", "temperature_c", "humidity_pct", "nitrogen", "phosphorus", "potassium", "season", "water_availability", "crop", "district"] if col in normalized_df.columns]
+    valid_features = [col for col in feature_columns if normalized_df[col].notna().any()]
+    if len(valid_features) < 3:
+        crop_history = normalized_df[normalized_df["crop"].astype(str).str.lower() == str(crop_name).lower()].copy() if "crop" in normalized_df.columns else pd.DataFrame()
+        fallback_yield = float(crop_history["yield_ton_per_hectare"].median()) if not crop_history.empty and crop_history["yield_ton_per_hectare"].notna().any() else float(normalized_df["yield_ton_per_hectare"].median()) if normalized_df["yield_ton_per_hectare"].notna().any() else 0.0
+        return {
+            "status": "fallback_only",
+            "predicted_yield_ton_per_hectare": round(fallback_yield, 3),
+            "notes": [f"Not enough agronomic variables were available to train a full yield model, so a dataset median estimate is being used for {crop_name.title()}."],
+        }
+
+    model = train_yield_model(normalized_df)
+    if model is None:
+        crop_history = normalized_df[normalized_df["crop"].astype(str).str.lower() == str(crop_name).lower()].copy() if "crop" in normalized_df.columns else pd.DataFrame()
+        fallback_yield = float(crop_history["yield_ton_per_hectare"].median()) if not crop_history.empty and crop_history["yield_ton_per_hectare"].notna().any() else float(normalized_df["yield_ton_per_hectare"].median()) if normalized_df["yield_ton_per_hectare"].notna().any() else 0.0
+        return {
+            "status": "fallback_only",
+            "predicted_yield_ton_per_hectare": round(fallback_yield, 3),
+            "notes": [f"Yield model could not be trained reliably from the current dataset, so a conservative median estimate is used for {crop_name.title()}."],
+        }
 
     input_row: Dict[str, Any] = {}
     for feature in feature_columns:
         if feature == "soil_ph":
-            input_row[feature] = soil_ph if soil_ph is not None else df[feature].median()
+            input_row[feature] = soil_ph if soil_ph is not None else normalized_df[feature].median()
         elif feature == "rainfall_mm":
-            input_row[feature] = rainfall_mm if rainfall_mm is not None else df[feature].median()
+            input_row[feature] = rainfall_mm if rainfall_mm is not None else normalized_df[feature].median()
         elif feature == "temperature_c":
-            input_row[feature] = temperature_c if temperature_c is not None else df[feature].median()
+            input_row[feature] = temperature_c if temperature_c is not None else normalized_df[feature].median()
         elif feature == "humidity_pct":
-            input_row[feature] = humidity_pct if humidity_pct is not None else df[feature].median()
+            input_row[feature] = humidity_pct if humidity_pct is not None else normalized_df[feature].median()
         elif feature == "nitrogen":
-            input_row[feature] = nitrogen if nitrogen is not None else df[feature].median()
+            input_row[feature] = nitrogen if nitrogen is not None else normalized_df[feature].median()
         elif feature == "phosphorus":
-            input_row[feature] = phosphorus if phosphorus is not None else df[feature].median()
+            input_row[feature] = phosphorus if phosphorus is not None else normalized_df[feature].median()
         elif feature == "potassium":
-            input_row[feature] = potassium if potassium is not None else df[feature].median()
+            input_row[feature] = potassium if potassium is not None else normalized_df[feature].median()
         elif feature == "season":
-            input_row[feature] = season if season is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Kharif"
+            input_row[feature] = season if season is not None else normalized_df[feature].mode().iloc[0] if not normalized_df[feature].mode().empty else "Kharif"
         elif feature == "water_availability":
-            input_row[feature] = water_availability if water_availability is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Medium"
+            input_row[feature] = water_availability if water_availability is not None else normalized_df[feature].mode().iloc[0] if not normalized_df[feature].mode().empty else "Medium"
         elif feature == "crop":
             input_row[feature] = crop_name
         elif feature == "district":
-            input_row[feature] = district if district is not None else df[feature].mode().iloc[0] if not df[feature].mode().empty else "Nagpur"
+            input_row[feature] = district if district is not None else normalized_df[feature].mode().iloc[0] if not normalized_df[feature].mode().empty else "Nagpur"
 
     input_df = pd.DataFrame([input_row], columns=feature_columns)
     predicted_yield = float(model.predict(input_df)[0])
@@ -529,9 +701,10 @@ def recommend_best_crops_for_region(
     if df.empty:
         return []
 
-    subset = df.copy()
-    if district and "district" in subset.columns:
-        district_matches = subset[subset["district"].astype(str).str.lower() == str(district).lower()]
+    subset = normalize_agricultural_columns(df)
+    district_col = resolve_column_name(subset, "district", "district_name", "state", "state_name", "location", "region")
+    if district and district_col:
+        district_matches = subset[subset[district_col].astype(str).str.lower() == str(district).lower()]
         if not district_matches.empty:
             subset = district_matches
 
@@ -550,11 +723,26 @@ def recommend_best_crops_for_region(
     if subset.empty:
         return []
 
-    crops = subset.groupby("crop").agg(
-        avg_yield=("yield_ton_per_hectare", "mean") if "yield_ton_per_hectare" in subset.columns else ("crop", "count"),
-        avg_soil_ph=("soil_ph", "mean") if "soil_ph" in subset.columns else ("crop", "count"),
-        avg_rainfall=("rainfall_mm", "mean") if "rainfall_mm" in subset.columns else ("crop", "count"),
-    ).reset_index()
+    crop_col = resolve_column_name(subset, "crop")
+    if crop_col is None:
+        return []
+    subset = subset.rename(columns={crop_col: "crop"})
+
+    yield_col = resolve_column_name(subset, "yield_ton_per_hectare", "yield")
+    soil_col = resolve_column_name(subset, "soil_ph")
+    rainfall_col = resolve_column_name(subset, "rainfall_mm", "annual_rainfall")
+
+    agg_kwargs = {}
+    if yield_col is not None:
+        agg_kwargs["avg_yield"] = (yield_col, "mean")
+    else:
+        agg_kwargs["avg_yield"] = ("crop", "count")
+    if soil_col is not None:
+        agg_kwargs["avg_soil_ph"] = (soil_col, "mean")
+    if rainfall_col is not None:
+        agg_kwargs["avg_rainfall"] = (rainfall_col, "mean")
+
+    crops = subset.groupby("crop").agg(**agg_kwargs).reset_index()
 
     if "avg_yield" in crops.columns and crops["avg_yield"].notna().any():
         crops = crops.sort_values("avg_yield", ascending=False).head(top_n)

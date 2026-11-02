@@ -37,6 +37,11 @@ def init_db() -> None:
             )
             """
         )
+
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "role" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
+
         conn.commit()
     finally:
         conn.close()
@@ -53,12 +58,11 @@ def ensure_default_user() -> None:
                 "INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)",
                 ("admin", "admin123", "admin@agriagent.local", "admin"),
             )
-            conn.commit()
         else:
             conn.execute(
-                "UPDATE users SET role = 'admin' WHERE username = 'admin' AND (role IS NULL OR role = '')",
+                "UPDATE users SET role = 'admin' WHERE username = 'admin' AND role != 'admin'",
             )
-            conn.commit()
+        conn.commit()
     finally:
         conn.close()
 

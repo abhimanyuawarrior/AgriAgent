@@ -126,3 +126,76 @@ def generate_agronomy_explanation(
             "recommendations": ["Keep the soil pH and water regime within target ranges for this crop.", "Schedule fertilizer and irrigation around the crop stage and forecasted weather."],
             "next_actions": ["Take soil samples for validation.", "Compare local conditions to the crop-specific agronomic thresholds before commitment."],
         }
+
+
+def generate_professional_pdf_copy(
+    crop: str,
+    status: Optional[str],
+    confidence: Optional[float],
+    yield_estimate: Optional[float],
+    reasons: List[str],
+    recommendations: List[str],
+    next_actions: List[str],
+    district: Optional[str] = None,
+) -> Dict[str, Any]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return {
+            "headline": f"{crop.title()} Crop Suitability Report",
+            "summary": f"{crop.title()} is being reviewed for the current agronomic profile. The current assessment indicates {status.lower() if status else 'a mixed suitability outcome'} with a confidence of {float(confidence or 0.0) * 100:.1f}%.",
+            "key_points": reasons[:4],
+            "recommendations": recommendations[:4],
+            "next_steps": next_actions[:4],
+        }
+
+    prompt = (
+        "You are a professional agronomy report editor. Rewrite this report so it reads like a clean, executive-style PDF summary for a farm advisory dashboard. "
+        "Keep it brief, polished, and highly readable. Use plain business English and avoid markdown. "
+        "Return JSON only with keys: headline, summary, key_points, recommendations, next_steps. "
+        f"Crop: {crop}\n"
+        f"Status: {status or 'Unknown'}\n"
+        f"Confidence: {float(confidence or 0.0) * 100:.1f}%\n"
+        f"Yield estimate: {yield_estimate if yield_estimate is not None else 'not available'}\n"
+        f"Reasons: {reasons}\n"
+        f"Recommendations: {recommendations}\n"
+        f"Next actions: {next_actions}\n"
+        f"District: {district or 'not provided'}\n"
+    )
+
+    try:
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 500},
+        }
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("` ")
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:].strip()
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return {
+                "headline": str(parsed.get("headline") or f"{crop.title()} Crop Suitability Report"),
+                "summary": str(parsed.get("summary") or "Crop suitability assessment summary is available."),
+                "key_points": parsed.get("key_points") or reasons[:4],
+                "recommendations": parsed.get("recommendations") or recommendations[:4],
+                "next_steps": parsed.get("next_steps") or next_actions[:4],
+            }
+    except Exception:
+        pass
+
+    return {
+        "headline": f"{crop.title()} Crop Suitability Report",
+        "summary": f"{crop.title()} is being reviewed for the current agronomic profile. The current assessment indicates {status.lower() if status else 'a mixed suitability outcome'} with a confidence of {float(confidence or 0.0) * 100:.1f}%.",
+        "key_points": reasons[:4],
+        "recommendations": recommendations[:4],
+        "next_steps": next_actions[:4],
+    }
