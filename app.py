@@ -254,9 +254,89 @@ def _build_minimal_pdf(lines: list[str]) -> bytes:
     return bytes(pdf)
 
 
+def _render_plotly_figure_to_png(fig) -> bytes | None:
+    if fig is None or not hasattr(fig, "data"):
+        return None
+
+    try:
+        plt.close("all")
+        fig_mpl, ax = plt.subplots(figsize=(9, 4.6), dpi=180)
+
+        title = getattr(getattr(fig, "layout", None), "title", None)
+        if title is not None:
+            title_text = getattr(title, "text", None) or str(title)
+            if title_text:
+                ax.set_title(title_text)
+
+        xaxis = getattr(getattr(fig, "layout", None), "xaxis", None)
+        yaxis = getattr(getattr(fig, "layout", None), "yaxis", None)
+        x_label = getattr(getattr(xaxis, "title", None), "text", None) or ""
+        y_label = getattr(getattr(yaxis, "title", None), "text", None) or ""
+        if x_label:
+            ax.set_xlabel(x_label)
+        if y_label:
+            ax.set_ylabel(y_label)
+
+        for trace in getattr(fig, "data", []) or []:
+            trace_type = getattr(trace, "type", None)
+            x_values = list(getattr(trace, "x", []) or [])
+            y_values = list(getattr(trace, "y", []) or [])
+
+            if trace_type == "bar":
+                if x_values and y_values:
+                    bar_color = getattr(getattr(trace, "marker", None), "color", None)
+                    if isinstance(bar_color, (list, tuple)):
+                        ax.bar(x_values, y_values, color=bar_color[: len(y_values)])
+                    else:
+                        ax.bar(x_values, y_values, color=bar_color or None)
+                continue
+
+            if trace_type == "histogram":
+                if x_values:
+                    bins = getattr(trace, "xbins", None)
+                    if bins is not None and hasattr(bins, "size") and bins.size is not None:
+                        ax.hist(x_values, bins=int(bins.size) if isinstance(bins.size, (int, float)) else "auto")
+                    else:
+                        ax.hist(x_values, bins="auto")
+                elif y_values:
+                    ax.hist(y_values, bins="auto")
+                continue
+
+            if trace_type == "scatter":
+                if x_values and y_values:
+                    marker_color = getattr(getattr(trace, "marker", None), "color", None)
+                    try:
+                        if isinstance(marker_color, (list, tuple)) and len(marker_color) == len(x_values):
+                            ax.scatter(x_values, y_values, c=marker_color, s=28)
+                        else:
+                            ax.scatter(x_values, y_values, c=marker_color or "#2e9d64", s=28)
+                    except Exception:
+                        ax.plot(x_values, y_values, marker="o", linestyle="-", linewidth=1.5)
+                continue
+
+            if x_values and y_values:
+                ax.plot(x_values, y_values)
+
+        fig_mpl.tight_layout()
+        buffer = io.BytesIO()
+        fig_mpl.savefig(buffer, format="png", dpi=180)
+        plt.close(fig_mpl)
+        image_bytes = buffer.getvalue()
+        if image_bytes:
+            return image_bytes
+    except Exception:
+        plt.close("all")
+
+    return None
+
+
 def _figure_to_png_bytes(fig) -> bytes:
     if fig is None:
         raise ValueError("Chart figure is missing.")
+
+    fallback_png = _render_plotly_figure_to_png(fig)
+    if fallback_png is not None:
+        return fallback_png
 
     for func in (
         lambda: pio.to_image(fig, format="png", width=900, height=420, scale=2),
@@ -272,28 +352,6 @@ def _figure_to_png_bytes(fig) -> bytes:
     buffer = io.BytesIO()
     try:
         pio.write_image(fig, buffer, format="png", scale=2)
-        image_bytes = buffer.getvalue()
-        if image_bytes:
-            return image_bytes
-    except Exception:
-        pass
-
-    try:
-        plt.close("all")
-        placeholder_fig, ax = plt.subplots(figsize=(8, 4.5))
-        ax.set_axis_off()
-        ax.text(
-            0.5,
-            0.5,
-            "Chart preview unavailable\nin deployed environment",
-            ha="center",
-            va="center",
-            fontsize=12,
-            color="#123a2a",
-            wrap=True,
-        )
-        placeholder_fig.tight_layout()
-        placeholder_fig.savefig(buffer, format="png", dpi=150)
         image_bytes = buffer.getvalue()
         if image_bytes:
             return image_bytes
